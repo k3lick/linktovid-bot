@@ -10,9 +10,10 @@ The sandbox network only allows real TLS, so pyrogram's TCP connections
 are routed through ws_bridge.py, which speaks Telegram's web-client
 obfuscated websocket transport (wss://kws<dc>.web.telegram.org/apiws).
 
-API credentials: public Telegram Desktop pair until the owner's own
-my.telegram.org pair becomes available; swap TELEGRAM_API_ID /
-TELEGRAM_API_HASH env vars when it does — no code change needed.
+API credentials: the owner's own my.telegram.org pair, via the
+TELEGRAM_API_ID / TELEGRAM_API_HASH env vars. No pair is bundled in
+the code — the public Telegram Desktop pair default was removed
+8 Nov 2026, so set your own pair before running.
 """
 
 import os
@@ -27,8 +28,8 @@ log = logging.getLogger("mtp")
 
 BASEDIR = os.path.dirname(os.path.abspath(__file__))
 
-API_ID = int(os.environ.get("TELEGRAM_API_ID", "2040"))
-API_HASH = os.environ.get("TELEGRAM_API_HASH", "b18441a1ff607e10a989891a5eb2e0c9")
+API_ID = os.environ.get("TELEGRAM_API_ID", "")
+API_HASH = os.environ.get("TELEGRAM_API_HASH", "")
 BOT_TOKEN = os.environ.get("BOT_TOKEN", "")
 
 _client: Client = None
@@ -94,6 +95,12 @@ async def get_client() -> Client:
     if _client is None:
         if not BOT_TOKEN:
             raise RuntimeError("BOT_TOKEN not set; cannot start MTProto client")
+        if not API_ID or not API_HASH:
+            raise RuntimeError(
+                "TELEGRAM_API_ID / TELEGRAM_API_HASH not set; get your own pair "
+                "at my.telegram.org — no pair is bundled in the code"
+            )
+        api_id = int(API_ID)
         if os.environ.get("BRIDGE_MODE", "1") == "1":
             # Restricted-network mode (e.g. sandbox that only allows HTTPS):
             # route MTProto TCP through a websocket bridge.
@@ -102,7 +109,7 @@ async def get_client() -> Client:
             _install_bridge_route()
         _client = Client(
             "dlbot_mtp",
-            api_id=API_ID,
+            api_id=api_id,
             api_hash=API_HASH,
             bot_token=BOT_TOKEN,
             workdir=BASEDIR,
@@ -113,7 +120,7 @@ async def get_client() -> Client:
         await _client.storage.port(2402)
         await _client.start()
         me = await _client.get_me()
-        log.info("MTProto client ready as @%s (api_id=%d)", me.username, API_ID)
+        log.info("MTProto client ready as @%s (api_id=%d)", me.username, api_id)
     return _client
 
 
