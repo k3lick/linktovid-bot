@@ -9,6 +9,7 @@ Files up to ~50 MB go out through the Bot API; bigger files (up to 2 GB)
 are uploaded via MTProto (mtp.py).
 """
 
+import base64
 import os
 import threading
 import time
@@ -189,42 +190,96 @@ async def send_file(update: Update, chat_id: int, path: str, size: int,
             )
 
 
-def run_music_download(query: str, workdir: str, track: dict) -> str:
-    """Search YouTube for the track and produce an mp3 in workdir.
+COOKIES_FILE = os.environ.get("YT_COOKIES_FILE", "/app/cookies.txt")
 
-    Returns the path of the finished mp3.
-    """
-    ydl_opts = {
+
+def _cookies_path() -> str:
+    """Cookie jar for yt-dlp: a file on disk, or YT_COOKIES_B64 pasted into
+    the host's env vars (Render secrets) and written to /tmp at first use."""
+    if os.path.exists(COOKIES_FILE):
+        return COOKIES_FILE
+    raw = os.environ.get("YT_COOKIES_B64")
+    if raw:
+        try:
+            data = base64.b64decode(raw)
+            tmp = "/tmp/yt_cookies.txt"
+            if not os.path.exists(tmp) or os.path.getsize(tmp) != len(data):
+                with open(tmp, "wb") as f:
+                    f.write(data)
+            return tmp
+        except Exception as e:
+            log.warning("YT_COOKIES_B64 could not be decoded: %s", e)
+    return COOKIES_FILE
+
+
+class MusicBlocked(Exception):
+    """YouTube refused the download from this server's IP."""
+
+
+def _music_ydl_opts(workdir: str) -> dict:
+    opts = {
         "outtmpl": os.path.join(workdir, "audio.%(ext)s"),
-        # song first, then progressively looser fallbacks
         "format": "bestaudio/best",
         "noplaylist": True,
         "quiet": True,
         "no_warnings": True,
         "no_color": True,
-        "writethumbnail": True,   # album art for the audio player
+        "writethumbnail": True,
+        "retries": 2,
+        "socket_timeout": 30,
         "postprocessors": [
             {"key": "FFmpegExtractAudio",
              "preferredcodec": "mp3", "preferredquality": "192"},
             {"key": "EmbedThumbnail"},
         ],
     }
-    with YoutubeDL(ydl_opts) as ydl:
-        ydl.extract_info("ytsearch1:" + query, download=True)
-    path = os.path.join(workdir, "audio.mp3")
-    if not os.path.exists(path):
-        raise RuntimeError("audio conversion failed")
-    # tag the file so music players show the right names
-    try:
-        from mutagen.easyid3 import EasyID3
-        tags = EasyID3(path)
-        tags["title"] = track["song"]
-        if track["artist"]:
-            tags["artist"] = track["artist"]
-        tags.save()
-    except Exception as e:
-        log.warning("mp3 tagging failed: %s", e)
-    return path
+    # A logged-in cookie jar is what gets us past YouTube's bot wall.
+    jar = _cookies_path()
+    if jar and os.path.exists(jar):
+        opts["cookiefile"] = jar
+    return opts
+
+
+def _looks_blocked(err: str) -> bool:
+    e = (err or "").lower()
+    return ("not a bot" in e or "sign in" in e
+            or "confirm you" in e or "cookies" in e)
+
+
+def run_music_download(query: str, workdir: str, track: dict) -> str:
+    """Search for the track and produce an mp3 in workdir.
+
+    YouTube first, SoundCloud as a fallback. Raises MusicBlocked when the
+    server itself is refused (bot wall / missing cookies) so the caller can
+    say something accurate instead of blaming the link.
+    """
+    errors = []
+    for target in ("ytsearch1:" + query, "scsearch1:" + query):
+        try:
+            with YoutubeDL(_music_ydl_opts(workdir)) as ydl:
+                ydl.extract_info(target, download=True)
+            path = os.path.join(workdir, "audio.mp3")
+            if not os.path.exists(path):
+                raise RuntimeError("audio conversion failed")
+            try:
+                from mutagen.easyid3 import EasyID3
+                tags = EasyID3(path)
+                tags["title"] = track["song"]
+                if track["artist"]:
+                    tags["artist"] = track["artist"]
+                tags.save()
+            except Exception as e:
+                log.warning("mp3 tagging failed: %s", e)
+            return path
+        except Exception as e:
+            msg = str(e)
+            errors.append(msg.split("\n")[0])
+            log.warning("music source %s failed: %s", target.split(":")[0], msg[:200])
+            if not _looks_blocked(msg):
+                continue
+    if errors and any(_looks_blocked(e) for e in errors):
+        raise MusicBlocked("; ".join(errors)[:300])
+    raise RuntimeError("; ".join(errors)[:300])
 
 
 async def handle_music(update: Update, context: ContextTypes.DEFAULT_TYPE,
@@ -254,6 +309,13 @@ async def handle_music(update: Update, context: ContextTypes.DEFAULT_TYPE,
         await react(update, ReactionEmoji.PARTY_POPPER)   # 🎉
     except ValueError as e:
         await update.message.reply_text(str(e), parse_mode="Markdown")
+        await react(update, ReactionEmoji.NEUTRAL_FACE)   # 😐
+    except MusicBlocked:
+        log.error("music blocked by source for %s", url)
+        await update.message.reply_text(
+            "I found the track but YouTube refused this server "
+            "(bot check). That's on my side, not your link — the "
+            "cookies need refreshing.")
         await react(update, ReactionEmoji.NEUTRAL_FACE)   # 😐
     except Exception as e:
         log.exception("music download failed")
