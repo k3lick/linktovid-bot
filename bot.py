@@ -32,9 +32,11 @@ from telegram import ReactionTypeEmoji
 
 # yt-dlp runs in its own thread pool inside handlers
 from yt_dlp import YoutubeDL
+from yt_dlp.utils import DownloadError
 
 import mtp
 import music
+import tiktok
 
 BOT_TOKEN = os.environ.get("BOT_TOKEN", "")
 MAX_SEND = 49 * 1024 * 1024        # Bot API path (50 MB limit)
@@ -102,12 +104,23 @@ def run_download(url: str, workdir: str) -> dict:
         # unaffected and gives direct, mergeable streams.
         "extractor_args": {"youtube": {"player_client": ["android", "web", "ios"]}},
     }
-    with YoutubeDL(ydl_opts) as ydl:
-        info = ydl.extract_info(url, download=True)
-        # For playlists, info may have entries; use the first one only
-        if "entries" in info:
-            entries = [e for e in info["entries"] if e]
-            info = entries[0] if entries else info
+    try:
+        with YoutubeDL(ydl_opts) as ydl:
+            info = ydl.extract_info(url, download=True)
+            # For playlists, info may have entries; use the first one only
+            if "entries" in info:
+                entries = [e for e in info["entries"] if e]
+                info = entries[0] if entries else info
+    except DownloadError as e:
+        # TikTok answers 10231 for plenty of public posts; yt-dlp can't
+        # resolve those, so try the CDN resolver before giving up.
+        msg = str(e)
+        if tiktok.is_tiktok(url) and ("10231" in msg or "not available" in msg.lower()):
+            log.warning("yt-dlp TikTok failed (%s), trying fallback", msg.split(";")[0][:120])
+            fb = tiktok.download(url, workdir)
+            return {"title": fb["title"], "uploader": fb["uploader"],
+                    "filepath": fb["filepath"], "id": "", "extractor": "tiktok-fallback"}
+        raise
 
     # Don't trust prepare_filename()'s guess: merged containers, format-id
     # suffixes, and extension swaps can all make the real file differ from
